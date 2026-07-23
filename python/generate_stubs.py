@@ -208,8 +208,10 @@ EXTRA_REEXPORTS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# Names added to a generated stub's ``__all__`` beyond what pyo3-stub-gen emits.
+# Adapter stub ``__all__`` is owned by ``sync_adapter_all_exports`` (copied from
+# the runtime facade), so only non-adapter modules appear here.
 EXTRA_ALL_EXPORTS: dict[str, tuple[str, ...]] = {
-    "nautilus_trader/adapters/binance/__init__.pyi": ("load_binance_instruments",),
     "nautilus_trader/trading/__init__.pyi": ("Controller",),
 }
 
@@ -345,6 +347,7 @@ def generate_stubs() -> bool:
         post_process_stubs(root)
         relocate_classes_from_libnautilus(root)
         inject_module_constants(root, workspace_root)
+        sync_adapter_all_exports(root)
         format_stub_files(root)
         remove_stale_top_level_adapter_stubs(root)
 
@@ -379,7 +382,7 @@ def write_config_stub(root: Path) -> None:
     """
     runtime_path = root / "config" / "__init__.py"
     stub_path = runtime_path.with_suffix(".pyi")
-    tree = ast.parse(runtime_path.read_text())
+    tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
     imports: dict[str, tuple[str, str]] = {}
     exports: list[str] | None = None
 
@@ -422,7 +425,7 @@ def write_config_stub(root: Path) -> None:
     lines.extend(["", "__all__ = ["])
     lines.extend(f'    "{name}",' for name in exports)
     lines.extend(["]", ""])
-    stub_path.write_text("\n".join(lines))
+    stub_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def inject_reexports(content: str, stub_path: Path) -> str:
@@ -464,7 +467,7 @@ def post_process_stubs(root: Path) -> None:
     renamed_enum_variants = collect_renamed_enum_variants(workspace_root)
 
     for stub_file in root.rglob("*.pyi"):
-        content = stub_file.read_text()
+        content = stub_file.read_text(encoding="utf-8")
         original = content
 
         # Ensure proper header with D401 ignore
@@ -516,7 +519,7 @@ def post_process_stubs(root: Path) -> None:
         content = normalize_stub_content(content)
 
         if content != original:
-            stub_file.write_text(content)
+            stub_file.write_text(content, encoding="utf-8")
 
 
 def remove_stale_top_level_adapter_stubs(root: Path) -> None:
@@ -737,17 +740,17 @@ def collect_rust_class_fixups(workspace_root: Path) -> dict[str, ClassMethodFixu
     fixups: dict[str, ClassMethodFixup] = {}
 
     for rust_file in sorted(workspace_root.glob("crates/**/src/**/*.rs")):
-        source = rust_file.read_text()
+        source = rust_file.read_text(encoding="utf-8")
         _collect_pyclass_name_fixups(source, fixups)
 
     for rust_file in sorted(workspace_root.glob("crates/**/src/python/**/*.rs")):
-        source = rust_file.read_text()
+        source = rust_file.read_text(encoding="utf-8")
         _collect_identifier_macro_fixups(source, fixups)
         _collect_pymethod_fixups(source, fixups)
         _collect_pyfunction_signature_defaults(source, fixups)
 
     for rust_file in sorted(workspace_root.glob("crates/**/src/**/*.rs")):
-        source = rust_file.read_text()
+        source = rust_file.read_text(encoding="utf-8")
         _collect_custom_data_macro_fixups(source, fixups)
 
     return fixups
@@ -766,7 +769,7 @@ def collect_renamed_enums(workspace_root: Path) -> set[str]:
     renamed: set[str] = set()
 
     for rust_file in sorted(workspace_root.glob("crates/**/src/**/*.rs")):
-        source = rust_file.read_text()
+        source = rust_file.read_text(encoding="utf-8")
         lines = source.splitlines()
         pending_attrs: list[str] = []
         i = 0
@@ -809,7 +812,7 @@ def collect_renamed_enum_variants(workspace_root: Path) -> dict[str, list[str]]:
     variants: dict[str, list[str]] = {}
 
     for rust_file in sorted(workspace_root.glob("crates/**/src/**/*.rs")):
-        source = rust_file.read_text()
+        source = rust_file.read_text(encoding="utf-8")
         lines = source.splitlines()
         pending_attrs: list[str] = []
         i = 0
@@ -1957,7 +1960,7 @@ def relocate_classes_from_libnautilus(root: Path) -> None:
     if lib_stub is None:
         return
 
-    source = lib_stub.read_text()
+    source = lib_stub.read_text(encoding="utf-8")
     remaining = source
 
     for module_suffix, fixup in MODULE_FIXUPS.items():
@@ -1980,13 +1983,13 @@ def relocate_classes_from_libnautilus(root: Path) -> None:
 
         # Read existing content if file exists
         if target_file.exists():
-            existing = target_file.read_text()
+            existing = target_file.read_text(encoding="utf-8")
         else:
             existing = ""
 
         # Merge the new class blocks into existing content
         merged = merge_stub_content(existing, blocks, fixup)
-        target_file.write_text(merged)
+        target_file.write_text(merged, encoding="utf-8")
 
     # Clean up the remaining _libnautilus content
     remaining = clean_orphaned_decorators(remaining)
@@ -1997,7 +2000,7 @@ def relocate_classes_from_libnautilus(root: Path) -> None:
         all_extracted_classes.update(fixup.classes)
     remaining = remove_from_all_list(remaining, all_extracted_classes)
 
-    lib_stub.write_text(remaining.strip() + "\n")
+    lib_stub.write_text(remaining.strip() + "\n", encoding="utf-8")
 
 
 def find_libnautilus_stub(root: Path) -> Path | None:
@@ -2887,7 +2890,7 @@ def collect_module_constants(workspace_root: Path) -> dict[str, list[ModuleConst
     for mod_rs in sorted(workspace_root.glob("crates/**/src/python/mod.rs")):
         crate_dir = mod_rs.parent.parent.parent
         module_path = _derive_module_path(crate_dir, workspace_root)
-        source = mod_rs.read_text()
+        source = mod_rs.read_text(encoding="utf-8")
 
         for match in M_ADD_CONST_RE.finditer(source):
             name = match.group(1) or match.group(2)
@@ -2933,7 +2936,7 @@ def _infer_constant_python_type(
         candidates.append(rust_name)
 
     for rs_file in crate_dir.glob("src/**/*.rs"):
-        source_lines = rs_file.read_text().splitlines()
+        source_lines = rs_file.read_text(encoding="utf-8").splitlines()
         for name in candidates:
             for line in source_lines:
                 match = re.match(
@@ -2961,7 +2964,7 @@ def inject_module_constants(root: Path, workspace_root: Path) -> None:
         if not stub_file.exists():
             continue
 
-        content = stub_file.read_text()
+        content = stub_file.read_text(encoding="utf-8")
         original = content
 
         new_names = [c.name for c in const_list if f"\n{c.name}:" not in content]
@@ -2974,7 +2977,7 @@ def inject_module_constants(root: Path, workspace_root: Path) -> None:
         content = _insert_constants_after_all(content, const_block)
 
         if content != original:
-            stub_file.write_text(content)
+            stub_file.write_text(content, encoding="utf-8")
 
 
 def _add_names_to_all(content: str, names: list[str]) -> str:
@@ -3004,6 +3007,103 @@ def _insert_constants_after_all(content: str, const_block: str) -> str:
 
     insert_pos = match.end()
     return content[:insert_pos] + "\n\n" + const_block + "\n" + content[insert_pos:]
+
+
+def sync_adapter_all_exports(root: Path) -> None:
+    """
+    Replace each adapter stub's ``__all__`` with the runtime adapter ``__all__``.
+
+    pyo3-stub-gen derives ``__all__`` from every registered module member, which
+    exposes raw clients, wire models, and endpoint helpers that the runtime
+    facade keeps private. Each adapter ``__init__.py`` defines a curated
+    ``__all__``; this copies it into the matching stub so runtime and stub
+    exports stay in exact agreement after every regeneration.
+
+    """
+    adapters_dir = root / "adapters"
+    if not adapters_dir.is_dir():
+        return
+
+    for runtime_path in sorted(adapters_dir.glob("*/__init__.py")):
+        stub_path = runtime_path.with_suffix(".pyi")
+        if not stub_path.exists():
+            continue
+
+        exports = _read_runtime_all(runtime_path)
+        stub_content = stub_path.read_text(encoding="utf-8")
+        _validate_stub_exports(stub_content, exports, stub_path)
+        stub_path.write_text(_replace_stub_all(stub_content, exports), encoding="utf-8")
+
+
+def _read_runtime_all(runtime_path: Path) -> list[str]:
+    """
+    Return the static ``__all__`` list declared in a runtime module.
+    """
+    tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets
+        ):
+            value = ast.literal_eval(node.value)
+            if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+                raise ValueError(f"{runtime_path}: __all__ must be a static list of strings")
+            if len(value) != len(set(value)):
+                raise ValueError(f"{runtime_path}: __all__ must not contain duplicates")
+            return value
+
+    raise ValueError(f"{runtime_path}: adapter facade must define __all__")
+
+
+def _replace_stub_all(content: str, exports: list[str]) -> str:
+    """
+    Replace a stub's ``__all__`` block with the given export names.
+    """
+    match = re.search(r"__all__\s*=\s*\[.*?]", content, re.DOTALL)
+    if match is None:
+        raise ValueError("adapter stub missing __all__ block")
+
+    items = ",\n".join(f'    "{name}"' for name in exports)
+    new_all = f"__all__ = [\n{items},\n]"
+    return content[: match.start()] + new_all + content[match.end() :]
+
+
+def _validate_stub_exports(stub_content: str, exports: list[str], stub_path: Path) -> None:
+    """
+    Fail generation when a runtime export is absent from the stub.
+
+    A name in ``__all__`` that the stub neither defines nor re-exports would
+    break ``from <adapter> import <name>`` for type checkers, so surface it as a
+    generation error rather than silently shipping a broken stub.
+
+    """
+    available = _stub_top_level_names(stub_content)
+    missing = sorted(set(exports) - available)
+    if missing:
+        raise ValueError(
+            f"{stub_path}: runtime __all__ names missing from stub: {missing}",
+        )
+
+
+def _stub_top_level_names(stub_content: str) -> set[str]:
+    """
+    Collect every top-level name a stub defines, imports, or re-exports.
+    """
+    tree = ast.parse(stub_content)
+    names: set[str] = set()
+
+    for node in tree.body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(a.asname or a.name for a in node.names)
+        elif isinstance(node, ast.Import):
+            names.update(a.asname or a.name.split(".")[0] for a in node.names)
+
+    return names
 
 
 def format_stub_files(root: Path) -> None:

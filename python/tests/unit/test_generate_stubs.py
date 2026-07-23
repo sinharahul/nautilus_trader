@@ -1185,6 +1185,91 @@ def test_remove_stale_top_level_adapter_stubs_deletes_generated_aliases(tmp_path
     assert non_stale_dir.exists()
 
 
+def test_sync_adapter_all_exports_copies_runtime_all_into_stub(tmp_path):
+    # Arrange: runtime facade declares a curated __all__; stub has the raw generated one.
+    root = tmp_path / "nautilus_trader"
+    adapter_dir = root / "adapters" / "bybit"
+    adapter_dir.mkdir(parents=True)
+    (adapter_dir / "__init__.py").write_text(
+        """
+from nautilus_trader._libnautilus.bybit import *  # noqa: F403
+
+__all__ = [
+    "BYBIT",
+    "BybitDataClientConfig",
+]
+""".lstrip(),
+    )
+    (adapter_dir / "__init__.pyi").write_text(
+        """
+__all__ = [
+    "BYBIT",
+    "BybitDataClientConfig",
+    "BybitHttpClient",
+    "BybitWebSocketClient",
+]
+
+
+class BybitDataClientConfig: ...
+class BybitHttpClient: ...
+class BybitWebSocketClient: ...
+BYBIT: str
+""".lstrip(),
+    )
+
+    # Act
+    generate_stubs.sync_adapter_all_exports(root)
+
+    # Assert
+    stub = (adapter_dir / "__init__.pyi").read_text()
+    exported = ast.literal_eval(
+        next(
+            node.value
+            for node in ast.parse(stub).body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets
+            )
+        ),
+    )
+    assert exported == ["BYBIT", "BybitDataClientConfig"]
+    # Definitions for non-exported members remain for explicit typed imports.
+    assert "class BybitHttpClient: ..." in stub
+
+
+def test_sync_adapter_all_exports_rejects_runtime_name_absent_from_stub(tmp_path):
+    # Arrange: runtime exports a name the stub does not define or import.
+    root = tmp_path / "nautilus_trader"
+    adapter_dir = root / "adapters" / "binance"
+    adapter_dir.mkdir(parents=True)
+    (adapter_dir / "__init__.py").write_text(
+        """
+__all__ = ["BINANCE", "MissingSymbol"]
+""".lstrip(),
+    )
+    (adapter_dir / "__init__.pyi").write_text(
+        """
+__all__ = ["BINANCE"]
+
+BINANCE: str
+""".lstrip(),
+    )
+
+    # Act / Assert
+    with pytest.raises(ValueError, match=r"runtime __all__ names missing from stub"):
+        generate_stubs.sync_adapter_all_exports(root)
+
+
+def test_read_runtime_all_rejects_non_static_or_duplicated_list(tmp_path):
+    # Arrange
+    runtime_path = tmp_path / "__init__.py"
+    runtime_path.write_text("__all__ = ['A', 'A', 'B']\n")
+
+    # Act / Assert
+    with pytest.raises(ValueError, match=r"__all__ must not contain duplicates"):
+        generate_stubs._read_runtime_all(runtime_path)
+
+
 def test_generated_stubs_do_not_expose_top_level_adapter_packages():
     # Arrange
     adapters_dir = STUB_ROOT / "adapters"
@@ -1453,6 +1538,43 @@ WRITABLE_CONFIG_PROPERTIES = {
     ): {"cache_path"},
 }
 
+# Generated stubs intentionally omit every public property on these wire-schema,
+# acknowledgement, and error DTOs. They are confirmed non-contract runtime members
+# under the plan property-audit "adapter wire-schema DTOs" classification, so the
+# bidirectional guard does not require stub coverage for them. Reduce this set only
+# after the owning crate exposes a member as part of the supported public contract.
+NON_CONTRACT_DTO_CLASSES = frozenset(
+    {
+        ("nautilus_trader.adapters.bybit", "BybitAccountDetails"),
+        ("nautilus_trader.adapters.bybit", "BybitFeeRate"),
+        ("nautilus_trader.adapters.bybit", "BybitNativeTpSlParams"),
+        ("nautilus_trader.adapters.bybit", "BybitOrder"),
+        ("nautilus_trader.adapters.bybit", "BybitOrderCursorList"),
+        ("nautilus_trader.adapters.bybit", "BybitServerTime"),
+        ("nautilus_trader.adapters.bybit", "BybitTickerData"),
+        ("nautilus_trader.adapters.bybit", "BybitTickersParams"),
+        ("nautilus_trader.adapters.bybit", "BybitWsAmendOrderParams"),
+        ("nautilus_trader.adapters.bybit", "BybitWsCancelOrderParams"),
+        ("nautilus_trader.adapters.bybit", "BybitWsPlaceOrderParams"),
+        ("nautilus_trader.adapters.databento", "DatabentoSubscriptionAck"),
+        ("nautilus_trader.adapters.okx", "OKXWebSocketError"),
+    },
+)
+
+# Runtime methods absent from generated stubs pending a source or generator fix.
+# The bidirectional guard surfaces each as a real contract gap; they are deferred
+# until Unit 7 checkbox 3 resolves macro, complex-signature, and classmethod stub
+# generation. Do not add entries here without a concrete deferral reason.
+DEFERRED_RUNTIME_METHODS = frozenset(
+    {
+        ("nautilus_trader.adapters.kraken", "KrakenFuturesHttpClient", "edit_orders_batch"),
+        ("nautilus_trader.adapters.kraken", "KrakenFuturesHttpClient", "submit_orders_batch"),
+        ("nautilus_trader.adapters.kraken", "KrakenSpotHttpClient", "submit_orders_batch"),
+        ("nautilus_trader.model", "CustomData", "from_json_bytes"),
+        ("nautilus_trader.model", "Price", "as_double"),
+    },
+)
+
 ADAPTER_CONFIG_SECRET_FIELDS = {
     "api_key",
     "api_secret",
@@ -1616,7 +1738,9 @@ def test_stub_constructor_matches_runtime(module_name, class_name):
 
 
 def test_stub_members_match_runtime_names():
-    mismatches = []
+    forward_missing = []
+    reverse_missing = []
+    kind_mismatches = []
     raw_runtime_names = []
 
     for stub_path in sorted(STUB_ROOT.rglob("__init__.pyi")):
@@ -1633,7 +1757,7 @@ def test_stub_members_match_runtime_names():
             for node in stub_module.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
-        mismatches.extend(
+        forward_missing.extend(
             f"{module_name}.{name}"
             for name in sorted(_stub_names_missing_at_runtime(stub_names, runtime_names))
         )
@@ -1644,17 +1768,14 @@ def test_stub_members_match_runtime_names():
         for stub_class in (node for node in stub_module.body if isinstance(node, ast.ClassDef)):
             runtime_class = getattr(module, stub_class.name, None)
             if not isinstance(runtime_class, type):
-                mismatches.append(f"{module_name}.{stub_class.name}")
+                forward_missing.append(f"{module_name}.{stub_class.name}")
                 continue
 
+            class_key = (module_name, stub_class.name)
             runtime_names = set(dir(runtime_class))
-            stub_names = {
-                node.name
-                for node in stub_class.body
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and (not node.name.startswith("__") or node.name in {"__init__", "__new__"})
-            }
-            mismatches.extend(
+            stub_kinds = _stub_member_kinds(stub_class.body, class_scope=True)
+            stub_names = set(stub_kinds)
+            forward_missing.extend(
                 f"{module_name}.{stub_class.name}.{name}"
                 for name in sorted(_stub_names_missing_at_runtime(stub_names, runtime_names))
             )
@@ -1663,10 +1784,28 @@ def test_stub_members_match_runtime_names():
                 for name in sorted(runtime_names)
                 if name.startswith("py_")
             )
+            _collect_reverse_member_drift(
+                class_key,
+                runtime_class,
+                stub_kinds,
+                reverse_missing,
+                kind_mismatches,
+            )
 
-    assert not mismatches, (
+    assert not forward_missing, (
         "Stub members missing at runtime; register intended public APIs or remove stale stub "
-        "metadata:\n" + "\n".join(mismatches)
+        "metadata:\n" + "\n".join(forward_missing)
+    )
+    assert not reverse_missing, (
+        "Runtime members missing from stubs; add the binding at the PyO3 source and regenerate, "
+        "or register confirmed non-contract members in NON_CONTRACT_DTO_CLASSES:\n"
+        + "\n".join(reverse_missing)
+    )
+    assert not kind_mismatches, (
+        "Stub and runtime members differ in property-versus-method kind:\n"
+        + "\n".join(
+            kind_mismatches,
+        )
     )
     assert not raw_runtime_names, "Raw Rust names exposed at runtime:\n" + "\n".join(
         raw_runtime_names,
@@ -1682,12 +1821,171 @@ def _stub_names_missing_at_runtime(stub_names, runtime_names):
     }
 
 
+def _stub_function_kind(fn):
+    for decorator in fn.decorator_list:
+        if isinstance(decorator, ast.Name) and decorator.id == "property":
+            return "property"
+        if isinstance(decorator, ast.Attribute):
+            if decorator.attr == "property":
+                return "property"
+            if decorator.attr in {"setter", "deleter"}:
+                return "accessor"
+    return "method"
+
+
+def _stub_member_kinds(stub_body, class_scope):
+    kinds: dict[str, str] = {}
+
+    for node in stub_body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if class_scope:
+            if node.name.startswith("__") and node.name not in {"__init__", "__new__"}:
+                continue
+        elif node.name.startswith("__"):
+            continue
+        kind = _stub_function_kind(node)
+        if kind == "property":
+            kinds[node.name] = "property"
+        elif kind == "method" and kinds.get(node.name) != "property":
+            kinds[node.name] = "method"
+    return kinds
+
+
+def _runtime_member_kind(runtime_class, name):
+    obj = inspect.getattr_static(runtime_class, name, None)
+    if obj is None:
+        return None
+    type_name = type(obj).__name__
+    if isinstance(obj, property) or type_name == "getset_descriptor":
+        return "property"
+    if type_name in {
+        "method_descriptor",
+        "classmethod_descriptor",
+        "staticmethod_descriptor",
+        "function",
+        "builtin_function_or_method",
+        "method",
+    }:
+        return "method"
+    if inspect.isfunction(obj) or inspect.ismethod(obj) or inspect.ismethoddescriptor(obj):
+        return "method"
+    return None
+
+
+def _keyword_alias(name):
+    return f"{name}_" if keyword.iskeyword(name) else None
+
+
+def _collect_reverse_member_drift(
+    class_key,
+    runtime_class,
+    stub_kinds,
+    reverse_missing,
+    kind_mismatches,
+):
+    module_name, class_name = class_key
+    non_contract_dto = class_key in NON_CONTRACT_DTO_CLASSES
+
+    for name in dir(runtime_class):
+        if name.startswith("_"):
+            continue
+        runtime_kind = _runtime_member_kind(runtime_class, name)
+        if runtime_kind is None:
+            continue
+        alias = _keyword_alias(name)
+        stub_name = alias if alias is not None and alias in stub_kinds else name
+        if stub_name in stub_kinds:
+            stub_kind = stub_kinds[stub_name]
+            if stub_kind != runtime_kind:
+                kind_mismatches.append(
+                    f"{module_name}.{class_name}.{name}: runtime {runtime_kind} vs stub {stub_kind}",
+                )
+            continue
+        if runtime_kind == "property" and non_contract_dto:
+            continue
+        if runtime_kind == "method" and (module_name, class_name, name) in DEFERRED_RUNTIME_METHODS:
+            continue
+        reverse_missing.append(f"{module_name}.{class_name}.{name} ({runtime_kind})")
+
+
+def test_collect_reverse_member_drift_reports_gaps_and_respects_allowlists(monkeypatch):
+    class Runtime:
+        @property
+        def matched_prop(self) -> int:
+            return 1
+
+        def matched_method(self) -> None:
+            pass
+
+        @property
+        def drifted_to_method(self) -> int:
+            return 1
+
+        @property
+        def allowlisted_prop(self) -> int:
+            return 1
+
+        def deferred_method(self) -> None:
+            pass
+
+        def unreported_gap(self) -> None:
+            pass
+
+    stub = ast.parse(
+        "class Runtime:\n"
+        "    @property\n    def matched_prop(self) -> int: ...\n"
+        "    def matched_method(self) -> None: ...\n"
+        "    def drifted_to_method(self) -> None: ...\n",
+    ).body[0]
+    stub_kinds = _stub_member_kinds(stub.body, class_scope=True)
+
+    key = ("ns", "Runtime")
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "NON_CONTRACT_DTO_CLASSES", frozenset({key}))
+    monkeypatch.setattr(module, "DEFERRED_RUNTIME_METHODS", frozenset({(*key, "deferred_method")}))
+
+    reverse_missing = []
+    kind_mismatches = []
+    _collect_reverse_member_drift(key, Runtime, stub_kinds, reverse_missing, kind_mismatches)
+
+    assert reverse_missing == ["ns.Runtime.unreported_gap (method)"]
+    assert kind_mismatches == [
+        "ns.Runtime.drifted_to_method: runtime property vs stub method",
+    ]
+
+
+def test_collect_reverse_member_drift_resolves_keyword_alias():
+    class TransactionLike:
+        pass
+
+    setattr(TransactionLike, "from", property(lambda self: "x"))
+
+    stub = ast.parse(
+        "class TransactionLike:\n    @property\n    def from_(self) -> str: ...\n",
+    ).body[0]
+    stub_kinds = _stub_member_kinds(stub.body, class_scope=True)
+
+    reverse_missing = []
+    kind_mismatches = []
+    _collect_reverse_member_drift(
+        ("ns", "TransactionLike"),
+        TransactionLike,
+        stub_kinds,
+        reverse_missing,
+        kind_mismatches,
+    )
+
+    assert reverse_missing == []
+    assert kind_mismatches == []
+
+
 def test_pylist_construction_propagates_pyresult_collections():
     violations = []
     list_pattern = re.compile(r"PyList::new\(py,\s*(\w+)(\?)?\)")
 
     for rust_path in sorted((WORKSPACE_ROOT / "crates").rglob("*.rs")):
-        lines = rust_path.read_text().splitlines()
+        lines = rust_path.read_text(encoding="utf-8").splitlines()
         for index, line in enumerate(lines):
             match = list_pattern.search(line)
             if match is None or match.group(2) is not None:
@@ -2288,7 +2586,7 @@ def test_authoring_config_py_new_and_getters_match_rust_fields():
 
     for class_name, (struct_path, binding_path) in AUTHORING_CONFIG_BINDINGS.items():
         rust_fields = _rust_struct_field_names(struct_path, class_name)
-        binding_content = binding_path.read_text()
+        binding_content = binding_path.read_text(encoding="utf-8")
         binding_block = _rust_block_after_marker(binding_content, f"impl {class_name}")
         constructor_params = _pyo3_signature_param_names(binding_block)
         getter_names = set(PYO3_GETTER_RE.findall(binding_block))
@@ -2337,7 +2635,7 @@ def _config_constructor_fixups_for_stub(
 
 
 def _rust_struct_field_names(path: Path, class_name: str) -> set[str]:
-    block = _rust_block_after_marker(path.read_text(), f"pub struct {class_name}")
+    block = _rust_block_after_marker(path.read_text(encoding="utf-8"), f"pub struct {class_name}")
     return set(RUST_STRUCT_FIELD_RE.findall(block))
 
 
